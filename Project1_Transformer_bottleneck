@@ -1,0 +1,357 @@
+%  1. trainNetwork   → trainnet
+%     trainnet takes a dlnetwork + loss string/handle separately.
+%     Signature: trainnet(X, Y, net, lossFcn, options)
+%
+%  2. regressionLayer → REMOVED from layer array.
+%     Loss is now "mse" passed directly to trainnet.
+%
+%  3. sigmoidLayer → kept inside the network (applies sigmoid
+%     before MSE loss, same behaviour as before).
+%
+%  4. layerGraph → dlnetwork
+%     trainnet requires a dlnetwork, not a layerGraph.
+%     Build the layerGraph with skip connections as before,
+%     then convert: net = dlnetwork(lgraph)
+%
+%  5. predict(net, X) → minibatchpredict(net, X)
+%     For dlnetwork objects, use minibatchpredict for inference.
+%     Output is [H W C N] single array matching the network output.
+%
+%  6. YTrain targets
+%     trainnet with "mse" expects targets in the same shape as the
+%     network output: [H W 1 N] single.
+%
+%  Required toolboxes: Deep Learning Toolbox, Image Processing Toolbox
+
+%% =========================================================
+clear; clc; close all;
+
+%% ----------------------------------------------------------
+% 1. Load Data
+%% ----------------------------------------------------------
+load('Single_Cell.mat');   % Combined_Data : 281x1 cell of 80x80 double
+load('Mask.mat');          % Combined_Mask : 281x1 cell of 80x80 logical
+
+numTrain = 200;
+numTest  = 81;
+
+XTrain = cat(4, Combined_Data{1:numTrain});         
+XTest  = cat(4, Combined_Data{numTrain+1:end});     
+
+YTrain = single(cat(4, Combined_Mask{1:numTrain})); 
+YTest  = single(cat(4, Combined_Mask{numTrain+1:end}));
+
+%% ----------------------------------------------------------
+% 2. Define U-Net Architecture with Transformer Bottleneck
+%% ----------------------------------------------------------
+inputSize = [80 80 1];
+
+layers = [
+    imageInputLayer(inputSize, Name="input", Normalization="none")
+
+    % Encoder 1
+    convolution2dLayer(3,16,Padding="same",Name="enc1_conv1")
+    reluLayer
+    convolution2dLayer(3,16,Padding="same",Name="enc1_conv2")
+    reluLayer(Name="enc1_relu2")
+    maxPooling2dLayer(2,Stride=2,Name="enc1_pool")  % 80x80->40x40
+
+    % Encoder 2
+    convolution2dLayer(3,32,Padding="same",Name="enc2_conv1")
+    reluLayer
+    convolution2dLayer(3,32,Padding="same",Name="enc2_conv2")
+    reluLayer(Name="enc2_relu2")
+    maxPooling2dLayer(2,Stride=2,Name="enc2_pool")  % 40x40->20x20
+
+    % Transformer Bottleneck 
+    % 2 conv
+    convolution2dLayer(3, 64, Padding="same", Name="btn_conv1")
+    reluLayer
+    convolution2dLayer(3, 64, Padding="same", Name="btn_conv2")
+    reluLayer(Name="btn_relu2")
+    %%%% ----------------------------------------------------------
+    %1flatten to break it into patches
+    %1 flatten 
+    functionLayer(@flattenToPatches, Formattable=true, Name="flatten_patches");
+    % pixel/location-wise self-attention on the 20x20 bottleneck map, 
+    %embedding dimension 64
+    selfAttentionLayer(4,64);
+    %1flatten to convert patches to image
+    functionLayer(@patchesToImage, Formattable=true,Name="reconstruct_patches");
+    %%%% ----------------------------------------------------------
+    
+    % Decoder 2
+    transposedConv2dLayer(2,32,Stride=2,Name="upconv2") %reconstruct patches to upconv2
+    reluLayer
+    depthConcatenationLayer(2,Name="concat2")
+    convolution2dLayer(3,32,Padding="same",Name="dec2_conv1")
+    reluLayer
+    convolution2dLayer(3,32,Padding="same",Name="dec2_conv2")
+    reluLayer(Name="dec2_relu2")
+
+    % Decoder 1
+    transposedConv2dLayer(2,16,Stride=2,Name="upconv1")
+    reluLayer
+    depthConcatenationLayer(2,Name="concat1")
+    convolution2dLayer(3,16,Padding="same",Name="dec1_conv1")
+    reluLayer
+    convolution2dLayer(3,16,Padding="same",Name="dec1_conv2")
+    reluLayer(Name="dec1_relu2")
+
+    % Output
+    convolution2dLayer(1,1,Name="final_conv")
+    sigmoidLayer(Name="sigmoid")
+];
+
+%% ----------------------------------------------------------
+% 3. Layer Graph and Skip Connections
+%% ----------------------------------------------------------
+lgraph = layerGraph(layers);
+lgraph = connectLayers(lgraph,"enc2_relu2","concat2/in2");
+lgraph = connectLayers(lgraph,"enc1_relu2","concat1/in2");
+
+%% ----------------------------------------------------------
+% 4. Convert to dlnetwork
+%% ----------------------------------------------------------
+net_mse = dlnetwork(lgraph); 
+net_l2loss=dlnetwork(lgraph);
+net_bce = dlnetwork(lgraph);
+% %% ----------------------------------------------------------
+% % 5. Training Options
+% %% ----------------------------------------------------------
+options = trainingOptions("adam", ... 
+    InitialLearnRate = 1e-4, ...
+    MaxEpochs = 25, ...
+    MiniBatchSize = 16, ...
+    Shuffle = "every-epoch", ...
+    L2Regularization = 1e-4, ...     
+    Plots = "training-progress", ...
+    Verbose = true);
+%% ----------------------------------------------------------
+% 6. Train
+%% ----------------------------------------------------------
+net_mse=trainnet(XTrain, YTrain, net_mse, "mse",options);
+net_bce = trainnet(XTrain,YTrain,net_bce,"crossentropy",options);    
+net_l2loss=trainnet(XTrain,YTrain,net_l2loss,"l2loss",options);
+% %% ----------------------------------------------------------
+% % 7. Predict & Threshold
+% %% ----------------------------------------------------------
+YPred_mse =minibatchpredict(net_mse, XTest);
+YPred_bse = minibatchpredict(net_bce, XTest);
+YPred_l2loss = minibatchpredict(net_l2loss, XTest);
+%% ----------------------------------------------------------
+% 8. Dice Coefficient
+function meanDice = computeMeanDice(pred, gt)
+    gt_bin = gt > 0.5;
+    pred_bin = pred > 0.5;
+
+    N = size(pred, 4);
+    diceScores = zeros(N, 1);
+
+    for i = 1:N
+        p = pred_bin(:,:,1,i);
+        g = gt_bin(:,:,1,i);
+
+        intersection = sum(p(:) & g(:));
+        diceScores(i) = (2 * intersection) / (sum(p(:)) + sum(g(:)) + eps);
+    end
+
+    meanDice = mean(diceScores);
+end
+
+%% ----------------------------------------------------------
+dice_mse  = computeMeanDice(YPred_mse, YTest);
+dice_bse= computeMeanDice(YPred_bse, YTest);
+dice_l2loss=computeMeanDice(YPred_l2loss, YTest);
+figure;
+b = bar([dice_mse, dice_bse, dice_l2loss], 0.5);
+b.FaceColor = 'flat';
+b.CData = [
+    0.2 0.4 0.8;   % MSE
+    0.8 0.3 0.2;   % BCE
+    0.2 0.7 0.3    % L2
+];
+set(gca, 'XTickLabel', {'MSE', 'BCE','L2-Loss'});
+ylabel('Mean Dice Score'); title('Test Performance'); grid on; 
+
+setappdata(0, 'loss_sgd', []);
+setappdata(0, 'loss_adam', []);
+opts_adam2 = trainingOptions("adam", ... %% try with stochastic gradient descent to compare
+    InitialLearnRate = 1e-3, ...
+    MaxEpochs = 25, ...
+    MiniBatchSize = 8, ...
+    Shuffle = "every-epoch", ...
+    L2Regularization = 1e-4, ...      %% try different values
+    Plots = "training-progress", ...
+    Verbose = true, ...
+    OutputFcn = @(info) collectLoss(info, 'adam'));
+opts_sgd =  trainingOptions("sgdm", ... %% try with stochastic gradient descent to compare
+    InitialLearnRate = 1e-3, ...
+    MaxEpochs = 25, ...
+    MiniBatchSize = 8, ...
+    Shuffle = "every-epoch", ...
+    L2Regularization = 1e-4, ...      %% try different values
+    Plots = "training-progress", ...
+    Verbose = true, ...
+     OutputFcn = @(info) collectLoss(info, 'sgd'));
+net_adam=dlnetwork(lgraph);
+net_sgd = dlnetwork(lgraph);
+net_adam=trainnet(XTrain, YTrain, net_adam, "mse",opts_adam2);
+net_sgd = trainnet(XTrain,YTrain,net_sgd,"mse",opts_sgd);
+YPred_adam =minibatchpredict(net_adam, XTest);
+YPred_sgd = minibatchpredict(net_sgd, XTest);
+dice_adam2  = computeMeanDice(YPred_adam, YTest);
+dice_sgd= computeMeanDice(YPred_sgd, YTest);
+loss_sgd  = getappdata(0, 'loss_sgd');
+loss_adam2 = getappdata(0, 'loss_adam');
+
+figure('Name', 'SGD vs Adam', 'Position', [200 200 900 400]);
+subplot(1,2,1);
+plot(loss_sgd, 'b-', 'LineWidth', 1, 'DisplayName', 'SGD'); hold on;
+plot(loss_adam2, 'r-', 'LineWidth', 1, 'DisplayName', 'Adam');
+xlabel('Iteration'); ylabel('Training Loss');
+title('Training Loss: SGD vs Adam'); legend; grid on;
+
+subplot(1,2,2);
+b = bar([dice_sgd, dice_adam2], 0.5);
+b.FaceColor = 'flat';
+b.CData = [0.2 0.4 0.8; 0.8 0.3 0.2];
+set(gca, 'XTickLabel', {'SGD', 'Adam'});
+ylabel('Mean Dice Score'); title('Test Performance'); grid on; 
+
+
+
+% 
+% 
+% %% ----------------------------------------------------------
+% % 9. Visualize
+
+
+nTest = size(XTest, 4);
+nShow = min(6, nTest);
+
+figure('Name', 'Predicted Mask Overlay', 'Position', [50 50 1500 700]);
+for k = 1:nShow
+
+    % -----------------------------
+    % Row 1: Original image
+    % -----------------------------
+    subplot(3, nShow, k);
+    imshow(XTest(:,:,1,k), []);
+    title(sprintf('Test #%d', k));   
+    % -----------------------------
+    % Row 2: Predicted mask
+    % -----------------------------
+    subplot(3, nShow, k + nShow);
+
+    pred_bin = YPred_adam(:,:,1,k) > 0.5;
+    imshow(pred_bin, []);
+    title('Predicted Mask');    
+    % -----------------------------
+    % Row 3: Overlay (TP/FP/FN)
+    % -----------------------------
+    subplot(3, nShow, k + 2*nShow);
+    img = XTest(:,:,1,k);
+    img_norm = mat2gray(img);  % normalize for display
+    img_rgb = repmat(img_norm, [1 1 3]);
+    gt_bin = YTest(:,:,1,k) > 0.5;
+    tp = single(pred_bin & gt_bin);     % True Positive  -> Green
+    fp = single(pred_bin & ~gt_bin);    % False Positive -> Red
+    fn = single(~pred_bin & gt_bin);    % False Negative -> Blue
+    overlay = img_rgb;
+    overlay(:,:,1) = min(overlay(:,:,1) + 0.5 * fp, 1); % Red
+    overlay(:,:,2) = min(overlay(:,:,2) + 0.5 * tp, 1); % Green
+    overlay(:,:,3) = min(overlay(:,:,3) + 0.5 * fn, 1); % Blue
+    imshow(overlay);
+    title('G=TP R=FP B=FN');
+end
+sgtitle('Test Set Predictions with Error Overlay', 'FontSize', 14);
+
+nTest = size(YTest, 4);
+
+diceScores = zeros(nTest, 1);
+bceScores  = zeros(nTest, 1);
+
+for i = 1:nTest
+    p = double(YPred_adam(:,:,1,i));
+    g = double(YTest(:,:,1,i));
+
+    % Binary masks for Dice
+    p_bin = p > 0.5;
+    g_bin = g > 0.5;
+
+    intersection = sum(p_bin(:) & g_bin(:));
+    diceScores(i) = (2 * intersection) / (sum(p_bin(:)) + sum(g_bin(:)) + eps);
+
+    % BCE computed on continuous prediction
+    p_clip = max(min(p, 1 - 1e-7), 1e-7);
+    bce = -(g .* log(p_clip) + (1 - g) .* log(1 - p_clip));
+    bceScores(i) = mean(bce(:));
+end
+
+fprintf('Mean Dice: %.4f +/- %.4f\n', mean(diceScores), std(diceScores));
+fprintf('Mean BCE:  %.4f +/- %.4f\n', mean(bceScores),  std(bceScores));
+
+figure('Name', 'Metrics Comparison: BCE vs Dice', 'Position', [200 200 600 500]);
+scatter(bceScores, diceScores, 40, 'filled', 'MarkerFaceColor', [0.2 0.5 0.8]);
+hold on;
+
+pfit = polyfit(bceScores, diceScores, 1);
+xfit = linspace(min(bceScores), max(bceScores), 100);
+yfit = polyval(pfit, xfit);
+plot(xfit, yfit, 'r-', 'LineWidth', 2, 'DisplayName', 'Trendline');
+
+hold off;
+xlabel('BCE Loss', 'FontSize', 12);
+ylabel('Dice Score', 'FontSize', 12);
+title('Per-Sample Comparison: BCE vs Dice', 'FontSize', 14);
+grid on;
+
+% %% ----------------------------------------------------------
+% idx = 81;                        %% Make a for-loop for 5-10 indices to present
+% figure;
+% subplot(1,3,1)
+% imshow(XTest(:,:,1,idx),[])
+% title('Original')
+% subplot(1,3,2)
+% imshow(YTest(:,:,1,idx)>0.5)
+% title('Ground Truth')
+% subplot(1,3,3)
+% imshow(YPred_binary(:,:,1,idx))
+% title('Prediction')
+
+
+function Y = flattenToPatches(X)
+    % X is H x W x 64 x B
+    sz = size(X);
+    H = sz(1);
+    W = sz(2);
+    C = sz(3);
+    B = sz(4);
+
+    Y = dlarray(reshape(X, H*W, C, B), "SCB");
+end
+
+function Y = patchesToImage(X)
+    % X is 400 x 64 x B
+    sz = size(X);
+    B = sz(3);
+
+    Y = dlarray(reshape(X, 20, 20, 64, B), "SSCB");
+end
+function stop = collectLoss(info, tag)
+    % Stores training loss values in appdata for later plotting.
+    % Usage: 'OutputFcn', @(info) collectLoss(info, 'tagName')
+
+    stop = false;
+    key = ['loss_' tag];
+
+    if ~isempty(info.TrainingLoss)
+        existing = getappdata(0, key);
+        if isempty(existing)
+            existing = [];
+        end
+        existing(end+1) = info.TrainingLoss; 
+        setappdata(0, key, existing);
+    end
+end
